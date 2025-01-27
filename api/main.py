@@ -1,4 +1,5 @@
 import time
+import socket
 from flask import Flask, jsonify, request
 from mcstatus import JavaServer
 from flask_cors import CORS
@@ -8,8 +9,9 @@ import re
 import logging
 from dotenv import load_dotenv
 from functools import lru_cache
-from typing import Dict, List, Tuple
+from typing import Dict, List, Tuple, Optional
 import json
+import struct
 from pathlib import Path
 
 # 初始化环境变量
@@ -71,64 +73,87 @@ def get_dimension_display_name(raw_dim: str) -> str:
 
 
 # RCON客户端封装
-
 class RCONClient:
-    """带重试机制的RCON客户端"""
+    """带无限重连机制的RCON客户端"""
 
     def __init__(self, host: str, port: int, password: str):
         self.host = host
         self.port = port
         self.password = password
-        self.retries = 3
-        self.conn = None  # 连接实例
+        self.conn: Optional[MCRcon] = None
+        self.last_connect_time = 0
+        self.connect_cooldown = 10  # 基础重连间隔（秒）
+        self.max_wait = 300  # 最大重试间隔（5分钟）
 
-    def connect(self):
-        if self.conn is None:
-            for i in range(self.retries):
-                try:
-                    self.conn = MCRcon(self.host, self.password, self.port)
-                    self.conn.connect()
-                    logger.info("成功连接到RCON")
-                    return
-                except MCRconException as e:
-                    if i == self.retries - 1:
-                        logger.critical(f"RCON连接失败: {str(e)}")
-                        raise
-                    logger.warning(f"RCON连接失败，第{i + 1}次重试... 错误: {str(e)}")
-                    time.sleep(2 ** i)  # 指数退避
+    def _calculate_wait(self, attempt: int) -> int:
+        """计算指数退避等待时间"""
+        wait = min(self.connect_cooldown * (2 ** attempt), self.max_wait)
+        return wait
 
-    def disconnect(self):
-        """断开RCON连接"""
-        if self.conn:
-            self.conn.disconnect()
-            self.conn = None
-            logger.info("RCON连接已断开")
+    def connect(self) -> None:
+        """持续尝试连接直到成功"""
+        attempt = 0
+        while True:
+            try:
+                self.disconnect()  # 清理旧连接
+                self.conn = MCRcon(self.host, self.password, self.port)
+                self.conn.connect()
+                logger.info("RCON连接成功")
+                self.last_connect_time = time.time()
+                return
+            except (MCRconException, socket.error, TimeoutError) as e:
+                wait = self._calculate_wait(attempt)
+                logger.warning(f"连接失败，{wait}秒后重试... 错误: {str(e)}")
+                time.sleep(wait)
+                attempt += 1
+            except TypeError as te:  # 处理mcrcon库的类型错误
+                logger.warning(f"检测到mcrcon类型错误，尝试修复连接...")
+                self.conn = MCRcon(
+                    host=self.host,
+                    password=self.password,
+                    port=self.port  # 确保显式指定端口参数
+                )
 
     def execute(self, command: str) -> str:
-        """执行RCON命令"""
-        self.connect()  # 确保已连接
-        try:
-            return self.conn.command(command)
-        except MCRconException as e:
-            logger.error(f"RCON命令执行失败: {command} - {str(e)}")
-            raise
+        """执行命令（带无限重试）"""
+        while True:
+            try:
+                if not self.conn:
+                    self.connect()
+                logger.debug(f"正在执行命令: {command}")
+                response = self.conn.command(command)
+                logger.debug(f"收到响应: {response[:200]}")  # 截断长响应
+                return response
+            except (MCRconException, ConnectionResetError, socket.error, struct.error) as e:
+                logger.error(f"命令执行失败（{e.__class__.__name__}）: {command} - {str(e)}")
+                self.disconnect()
+                time.sleep(self.connect_cooldown)
+            except Exception as e:
+                logger.error(f"未知错误: {str(e)}")
+                self.disconnect()
+                time.sleep(self.connect_cooldown)
 
-    def __enter__(self):
-        self.connect()  # 在进入时连接
-        return self
+    def disconnect(self):
+        """安全断开连接"""
+        if self.conn:
+            try:
+                self.conn.disconnect()
+            except Exception as e:
+                logger.debug(f"断开连接异常: {str(e)}")
+            finally:
+                self.conn = None
+        logger.debug("RCON连接已清理")
 
-    def __exit__(self, exc_type, exc_val, exc_tb):
-        self.disconnect()  # 在退出时断开连接
+    def __del__(self):
+        self.disconnect()
 
 
-# 全局RCON客户端
+# 全局RCON客户端实例
 rcon_client = RCONClient(RCON_HOST, RCON_PORT, RCON_PASSWORD)
-rcon_client.connect()  # 在应用启动时建立连接
 
 
 # 玩家数据解析
 class PlayerDataParser:
-    """玩家数据解析器"""
     POS_PATTERN = re.compile(r"Pos:\s*\[([\d., dE+-]+)]")
     DIMENSION_PATTERN = re.compile(r'Dimension:\s*"([^"]+)"')
     PLAYERNAME_PATTERN = re.compile(r"([a-zA-Z0-9_]{3,16})(?:,|$)")
@@ -138,13 +163,11 @@ class PlayerDataParser:
 
     @classmethod
     def parse_players(cls, list_response: str) -> List[str]:
-        """从list命令响应中解析玩家列表"""
         matches = cls.PLAYERNAME_PATTERN.findall(list_response)
         return list(set(matches)) if matches else []
 
     @classmethod
     def parse_entity_data(cls, response: str) -> Dict:
-        """解析实体数据（严格模式，无默认值）"""
         result = {
             "pos": None,
             "dimension": None,
@@ -155,8 +178,7 @@ class PlayerDataParser:
 
         try:
             # 坐标解析
-            pos_match = cls.POS_PATTERN.search(response)
-            if pos_match:
+            if pos_match := cls.POS_PATTERN.search(response):
                 pos_str = pos_match.group(1).replace('d', '').strip()
                 try:
                     x, y, z = map(float, pos_str.split(", "))
@@ -165,8 +187,7 @@ class PlayerDataParser:
                     logger.warning(f"坐标格式错误: {pos_str}")
 
             # 维度解析
-            dim_match = cls.DIMENSION_PATTERN.search(response)
-            if dim_match:
+            if dim_match := cls.DIMENSION_PATTERN.search(response):
                 raw_dim = dim_match.group(1)
                 result["dimension"] = {
                     "raw": raw_dim,
@@ -174,8 +195,7 @@ class PlayerDataParser:
                 }
 
             # 生命值解析
-            health_match = cls.HEALTH_PATTERN.search(response)
-            if health_match:
+            if health_match := cls.HEALTH_PATTERN.search(response):
                 health_val = health_match.group(1)
                 try:
                     result["health"] = float(health_val) if '.' in health_val else int(health_val)
@@ -183,37 +203,33 @@ class PlayerDataParser:
                     logger.warning(f"生命值转换失败: {health_val}")
 
             # 饱食度解析
-            food_match = cls.FOOD_PATTERN.search(response)
-            if food_match:
+            if food_match := cls.FOOD_PATTERN.search(response):
                 try:
                     result["food"] = int(food_match.group(1))
                 except (ValueError, TypeError):
                     logger.warning(f"饱食度转换失败: {food_match.group(1)}")
 
             # 等级解析
-            level_match = cls.LEVEL_PATTERN.search(response)
-            if level_match:
+            if level_match := cls.LEVEL_PATTERN.search(response):
                 try:
                     result["level"] = int(level_match.group(1))
                 except (ValueError, TypeError):
                     logger.warning(f"等级转换失败: {level_match.group(1)}")
 
         except Exception as e:
-            logger.error(f"全局解析异常: {str(e)}")
+            logger.error(f"解析异常: {str(e)}")
 
-        # 清理空值字段
         return {k: v for k, v in result.items() if v is not None}
 
 
-# API 端点实现
+# API端点实现
 @app.route('/api/player/avatar', methods=['GET'])
 def get_avatar():
-    """获取玩家头像"""
     if not (uuid := request.args.get('uuid')):
         return jsonify({"error": "缺少UUID参数"}), 400
     return jsonify({
         "uuid": uuid,
-        "avatar_url": f"https://crafatar.com/avatars/{uuid}"
+        "avatar_url": f"https://crafatar.com/avatars/{uuid}?overlay"
     })
 
 
@@ -263,16 +279,6 @@ def get_server_status():
         return jsonify({"error": "无法获取服务器状态"}), 500
 
 
-def format_minecraft_time(time_ticks: int) -> str:
-    """将 Minecraft 游戏刻转换为可读时间格式 (HH:MM)"""
-    if time_ticks is None:
-        return "未知"
-    time_ticks %= 24000  # 确保时间在一天内
-    hours = (time_ticks // 1000 + 6) % 24
-    minutes = int((time_ticks % 1000) / 1000 * 60)
-    return f"{hours:02d}:{minutes:02d}"
-
-
 def format_uptime(seconds: int) -> str:
     """将秒数格式化为 HH:MM:SS"""
     hours = seconds // 3600
@@ -281,51 +287,83 @@ def format_uptime(seconds: int) -> str:
     return f"{hours:02d}:{minutes:02d}:{seconds:02d}"
 
 
+def format_minecraft_time(ticks: Optional[int]) -> str:
+    if not ticks:
+        return "未知"
+    ticks %= 24000
+    hours = (ticks // 1000 + 6) % 24
+    minutes = int((ticks % 1000) / 1000 * 60)
+    return f"{hours:02}:{minutes:02}"
+
+
 @app.route('/api/server/player_info', methods=['GET'])
 def get_player_infos():
-    """获取玩家信息"""
     try:
         list_resp = rcon_client.execute("list")
-        logger.debug(f"list命令响应: {list_resp}")
+        logger.debug(f"玩家列表响应: {list_resp}")
+        if "There are 0" in list_resp:
+            return jsonify([])
+
         players = PlayerDataParser.parse_players(list_resp)
+        if not players:
+            return jsonify([])
 
         results = []
         for player in players:
             try:
                 entity_resp = rcon_client.execute(f"data get entity {player}")
+
+                # 新增响应有效性检查
+                if "No entity was found" in entity_resp:
+                    logger.warning(f"玩家 {player} 不存在")
+                    continue
+                if "Unable to find entity" in entity_resp:
+                    logger.warning(f"无法定位玩家 {player}")
+                    continue
+
+                logger.debug(f"{player} 的实体数据: {entity_resp[:200]}")  # 截断长响应
                 data = PlayerDataParser.parse_entity_data(entity_resp)
 
-                # 校验必要字段
                 if not data.get("pos") or not data.get("dimension"):
                     logger.warning(f"玩家 {player} 数据不完整，跳过")
                     continue
 
                 results.append({
                     "name": player,
-                    "world": data["dimension"]["display"],
-                    "raw_dimension": data["dimension"]["raw"],
-                    "location": {
-                        "x": round(data["pos"][0], 2),
-                        "y": round(data["pos"][1], 2),
-                        "z": round(data["pos"][2], 2)
+                    "dimension": data["dimension"],
+                    "position": {
+                        "x": round(data["pos"][0], 1),
+                        "y": round(data["pos"][1], 1),
+                        "z": round(data["pos"][2], 1)
                     },
-                    "status": {
-                        k: v for k, v in data.items()
-                        if k in ["health", "food", "level"] and v is not None
-                    }
+                    "status": {k: v for k, v in data.items() if k in ["health", "food", "level"]}
                 })
-            except Exception as e:
-                logger.warning(f"玩家 {player} 数据获取失败: {str(e)}")
+            except Exception as pe:
+                logger.error(f"处理玩家 {player} 时出错: {str(pe)}", exc_info=True)
+
         return jsonify(results)
     except Exception as e:
-        logger.error(f"RCON操作失败: {str(e)}")
-        return jsonify({"error": "服务器连接失败"}), 503
+        logger.error(f"获取玩家信息失败: {str(e)}", exc_info=True)
+        return jsonify({"error": "内部服务器错误"}), 500
 
 
-# 运行应用
+# 健康检查端点
+@app.route('/health', methods=['GET'])
+def health_check():
+    return jsonify({
+        "status": "ok",
+        "uptime": int(time.time() - SERVER_START_TIME),
+        "rcon_connected": rcon_client.conn is not None
+    })
+
+
 if __name__ == '__main__':
     try:
+        # 初始化连接
+        rcon_client.connect()
         app.run(host='0.0.0.0', port=5000, debug=False)
     except KeyboardInterrupt:
-        logger.info("服务器关闭...")
+        logger.info("正在关闭服务器...")
+        rcon_client.disconnect()
+    finally:
         rcon_client.disconnect()
